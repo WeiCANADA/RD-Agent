@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import fire
+import pandas as pd
 
 from rdagent.app.qlib_rd_loop.conf import FACTOR_FROM_REPORT_PROP_SETTING
 from rdagent.app.qlib_rd_loop.factor import FactorRDLoop
@@ -16,11 +17,19 @@ from rdagent.core.proposal import Hypothesis, HypothesisFeedback
 from rdagent.log import rdagent_logger as logger
 from rdagent.oai.llm_utils import APIBackend
 from rdagent.scenarios.qlib.experiment.factor_experiment import QlibFactorExperiment
+from rdagent.scenarios.qlib.factor_experiment_loader.json_loader import (
+    FactorExperimentLoaderFromDict,
+)
 from rdagent.scenarios.qlib.factor_experiment_loader.pdf_loader import (
     FactorExperimentLoaderFromPDFfiles,
+    check_factor_viability,
+    extract_factors_from_report_dict,
+    merge_file_to_factor_dict_to_factor_dict,
 )
 from rdagent.utils.agent.tpl import T
 from rdagent.utils.workflow import LoopMeta
+
+SUPPORTED_REPORT_SUFFIXES = {".pdf", ".csv", ".json", ".md", ".txt"}
 
 
 def generate_hypothesis(factor_result: dict, report_content: str) -> str:
@@ -69,14 +78,26 @@ def extract_hypothesis_and_exp_from_reports(report_file_path: str) -> QlibFactor
         QlibFactorExperiment: An instance of QlibFactorExperiment containing the extracted details.
         None: If no valid experiment is found in the report.
     """
-    exp = FactorExperimentLoaderFromPDFfiles().load(report_file_path)
-    if exp is None or exp.sub_tasks == []:
-        return None
+    report_path = Path(report_file_path)
 
-    pdf_screenshot = extract_first_page_screenshot_from_pdf(report_file_path)
-    logger.log_object(pdf_screenshot, tag="load_pdf_screenshot")
+    if report_path.suffix.lower() == ".pdf":
+        exp = FactorExperimentLoaderFromPDFfiles().load(report_file_path)
+        if exp is None or exp.sub_tasks == []:
+            return None
 
-    docs_dict = load_and_process_pdfs_by_langchain(report_file_path)
+        pdf_screenshot = extract_first_page_screenshot_from_pdf(report_file_path)
+        logger.log_object(pdf_screenshot, tag="load_pdf_screenshot")
+
+        docs_dict = load_and_process_pdfs_by_langchain(report_file_path)
+    else:
+        docs_dict = {str(report_path): _load_non_pdf_report_content(report_path)}
+        useful_report_dict = {str(report_path): {"class": 1}}
+        file_to_factor_result = extract_factors_from_report_dict(docs_dict, useful_report_dict)
+        factor_dict = merge_file_to_factor_dict_to_factor_dict(file_to_factor_result)
+        _, filtered_factor_dict = check_factor_viability(factor_dict)
+        exp = FactorExperimentLoaderFromDict().load(filtered_factor_dict)
+        if exp is None or exp.sub_tasks == []:
+            return None
 
     factor_result = {
         task.factor_name: {
@@ -94,6 +115,37 @@ def extract_hypothesis_and_exp_from_reports(report_file_path: str) -> QlibFactor
     return exp
 
 
+def _load_non_pdf_report_content(report_path: Path) -> str:
+    suffix = report_path.suffix.lower()
+
+    if suffix == ".csv":
+        # Use sample rows to cap prompt size while preserving schema context.
+        try:
+            sample_df = pd.read_csv(report_path, nrows=200)
+            return sample_df.to_csv(index=False)
+        except Exception:
+            return report_path.read_text(encoding="utf-8", errors="ignore")[:50000]
+
+    if suffix == ".json":
+        try:
+            content = json.loads(report_path.read_text(encoding="utf-8", errors="ignore"))
+            return json.dumps(content, ensure_ascii=False)[:50000]
+        except Exception:
+            return report_path.read_text(encoding="utf-8", errors="ignore")[:50000]
+
+    return report_path.read_text(encoding="utf-8", errors="ignore")[:50000]
+
+
+def _discover_report_files(report_folder: str) -> list[Path]:
+    root = Path(report_folder)
+    report_files = [
+        p
+        for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED_REPORT_SUFFIXES
+    ]
+    return sorted(report_files)
+
+
 class FactorReportLoop(FactorRDLoop, metaclass=LoopMeta):
     def __init__(self, report_folder: str = None):
         super().__init__(PROP_SETTING=FACTOR_FROM_REPORT_PROP_SETTING)
@@ -102,7 +154,7 @@ class FactorReportLoop(FactorRDLoop, metaclass=LoopMeta):
                 open(FACTOR_FROM_REPORT_PROP_SETTING.report_result_json_file_path, "r")
             )
         else:
-            self.judge_pdf_data_items = [i for i in Path(report_folder).rglob("*.pdf")]
+            self.judge_pdf_data_items = _discover_report_files(report_folder)
 
         self.loop_n = min(len(self.judge_pdf_data_items), FACTOR_FROM_REPORT_PROP_SETTING.report_limit)
         self.shift_report = (
@@ -151,8 +203,11 @@ def main(report_folder=None, path=None, all_duration=None, checkout=True):
     """
     if path is None and report_folder is None:
         model_loop = FactorReportLoop()
-    elif path is not None:
+    elif path is not None and Path(path).exists():
         model_loop = FactorReportLoop.load(path, checkout=checkout)
+    elif path is not None and report_folder is not None:
+        logger.warning(f"Session path {path} does not exist. Starting a new run from report_folder instead.")
+        model_loop = FactorReportLoop(report_folder=report_folder)
     else:
         model_loop = FactorReportLoop(report_folder=report_folder)
 

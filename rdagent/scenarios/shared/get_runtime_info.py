@@ -13,6 +13,10 @@ def get_runtime_environment_by_env(env: Env) -> str:
     stdout = implementation.execute(env=env, entry=f"python {fname}")
     # Extract JSON from stdout (skip CUDA/container warnings)
     json_match = re.search(r"\{.*\}", stdout, re.DOTALL)
+    if json_match is None:
+        # Keep scenario initialization robust even when auxiliary shell tools
+        # (such as GNU timeout) are unavailable in the runtime environment.
+        return stdout.strip()
     return json.dumps(json.loads(json_match.group()), indent=2)
 
 
